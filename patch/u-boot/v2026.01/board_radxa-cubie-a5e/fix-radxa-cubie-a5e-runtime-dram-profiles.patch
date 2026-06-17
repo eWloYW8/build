@@ -1,0 +1,353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: eWloYW8 <3171132517@qq.com>
+Date: Wed, 17 Jun 2026 00:00:00 +0000
+Subject: sunxi: radxa-cubie-a5e: select DRAM profile by detected size
+
+Radxa ships separate Cubie A5E DRAM parameter sets.  The 1GB LPDDR4
+variant uses cubie_a5e/sys_config.fex, while the larger LPDDR4x
+variants use cubie_a5e/sys_config_ddr_2GB.fex.
+
+The common A523 driver already performs an initial low-speed DRAM pass
+to detect rank, bus width and size, then reinitializes DRAM with the
+final clock and timing.  Keep that first pass generic, but after
+detection choose the Radxa profile for the final initialization:
+
+  - <= 1024 MiB: cubie_a5e/sys_config.fex
+  - >  1024 MiB: cubie_a5e/sys_config_ddr_2GB.fex
+
+Some LPDDR4 mode registers are currently hard-coded in the timing and
+PHY initialization paths, so thread them through struct dram_config
+before selecting the Cubie A5E profile.
+
+Signed-off-by: eWloYW8 <3171132517@qq.com>
+---
+ arch/arm/include/asm/arch-sunxi/dram_sun55i_a523.h | 10 ++-
+ arch/arm/mach-sunxi/Kconfig                        |  8 ++
+ arch/arm/mach-sunxi/dram_sun55i_a523.c             | 95 ++++++++++++++++------
+ arch/arm/mach-sunxi/dram_timings/a523_ddr3.c       |  3 +-
+ arch/arm/mach-sunxi/dram_timings/a523_lpddr4.c     | 18 ++--
+ configs/radxa-cubie-a5e_defconfig                  |  1 +
+ 6 files changed, 97 insertions(+), 38 deletions(-)
+
+diff --git a/arch/arm/include/asm/arch-sunxi/dram_sun55i_a523.h b/arch/arm/include/asm/arch-sunxi/dram_sun55i_a523.h
+index 08bfe462..e405324b 100644
+--- a/arch/arm/include/asm/arch-sunxi/dram_sun55i_a523.h
++++ b/arch/arm/include/asm/arch-sunxi/dram_sun55i_a523.h
+@@ -136,6 +136,14 @@ struct dram_config {
+ 	u8 bus_full_width;
+ 	u32 clk;
+ 	u32 odt_en;
++	u8 mr1;
++	u8 mr2;
++	u8 mr3;
++	u8 mr4;
++	u8 mr11;
++	u8 mr12;
++	u8 mr14;
++	u8 mr22;
+ 	u32 tpr11;
+ 	u32 tpr12;
+ 	u32 tpr14;
+@@ -148,6 +156,6 @@ static inline int ns_to_t(int nanoseconds, u32 clk)
+ 	return DIV_ROUND_UP(ctrl_freq * nanoseconds, 1000);
+ }
+ 
+-void mctl_set_timing_params(u32 clk);
++void mctl_set_timing_params(const struct dram_config *config);
+ 
+ #endif /* _SUNXI_DRAM_SUN55I_T527_H */
+diff --git a/arch/arm/mach-sunxi/Kconfig b/arch/arm/mach-sunxi/Kconfig
+index e979ee4a..5109d2dd 100644
+--- a/arch/arm/mach-sunxi/Kconfig
++++ b/arch/arm/mach-sunxi/Kconfig
+@@ -62,6 +62,14 @@ config DRAM_SUN55I_A523
+ 	help
+ 	  Select this DRAM controller driver for A523/T527 SoCs.
+ 
++config RADXA_CUBIE_A5E_DRAM_PROFILES
++	bool "Use Radxa Cubie A5E capacity-based DRAM profiles"
++	depends on MACH_SUN55I_A523 && SUNXI_DRAM_A523_LPDDR4
++	help
++	  Use Radxa Cubie A5E DRAM parameters selected by detected memory
++	  size. The 1GB LPDDR4 board uses a different timing profile from
++	  the LPDDR4x 2GB/4GB boards.
++
+ if DRAM_SUN50I_H616 || DRAM_SUN50I_A133 || DRAM_SUN55I_A523
+ config DRAM_SUNXI_DX_ODT
+ 	hex "DRAM DX ODT parameter"
+diff --git a/arch/arm/mach-sunxi/dram_sun55i_a523.c b/arch/arm/mach-sunxi/dram_sun55i_a523.c
+index 1ffb6286..1110a7d4 100644
+--- a/arch/arm/mach-sunxi/dram_sun55i_a523.c
++++ b/arch/arm/mach-sunxi/dram_sun55i_a523.c
+@@ -924,7 +924,7 @@ static bool mctl_phy_init(const struct dram_para *para,
+ 	struct sunxi_mctl_ctl_reg * const mctl_ctl =
+ 			(struct sunxi_mctl_ctl_reg *)SUNXI_DRAM_CTL0_BASE;
+ 	void *const prcm = (void *)SUNXI_PRCM_BASE;
+-	u32 val, val2, mr1, mr2;
++	u32 val, val2;
+ 	int i;
+ 
+ 	clrbits_le32(prcm + CCU_PRCM_SYS_PWROFF_GATING, 1);
+@@ -1187,42 +1187,31 @@ static bool mctl_phy_init(const struct dram_para *para,
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 		break;
+ 	case SUNXI_DRAM_TYPE_LPDDR4:
+-		if (config->clk <= 936) {
+-			mr1 = 0x34;
+-			mr2 = 0x1b;
+-		} else if (config->clk <= 1200) {
+-			mr1 = 0x54;
+-			mr2 = 0x2d;
+-		} else {
+-			mr1 = 0x64;
+-			mr2 = 0x36;
+-		}
+-
+ 		writel(0x0, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0x100 | mr1, &mctl_ctl->mrctrl1);
++		writel(0x100 | config->mr1, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0x200 | mr2, &mctl_ctl->mrctrl1);
++		writel(0x200 | config->mr2, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0x333, &mctl_ctl->mrctrl1);
++		writel(0x300 | config->mr3, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0x403, &mctl_ctl->mrctrl1);
++		writel(0x400 | config->mr4, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0xb04, &mctl_ctl->mrctrl1);
++		writel(0xb00 | config->mr11, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0xc72, &mctl_ctl->mrctrl1);
++		writel(0xc00 | config->mr12, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+@@ -1230,11 +1219,11 @@ static bool mctl_phy_init(const struct dram_para *para,
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0xe08, &mctl_ctl->mrctrl1);
++		writel(0xe00 | config->mr14, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 
+-		writel(0x1626, &mctl_ctl->mrctrl1);
++		writel(0x1600 | config->mr22, &mctl_ctl->mrctrl1);
+ 		writel(0x800000f0, &mctl_ctl->mrctrl0);
+ 		mctl_await_completion(&mctl_ctl->mrctrl0, BIT(31), 0);
+ 		break;
+@@ -1353,7 +1342,7 @@ static bool mctl_ctrl_init(const struct dram_para *para,
+ 
+ 	mctl_set_addrmap(config);
+ 
+-	mctl_set_timing_params(config->clk);
++	mctl_set_timing_params(config);
+ 
+ 	writel(0, &mctl_ctl->pwrctl);
+ 
+@@ -1412,6 +1401,59 @@ static const struct dram_para para = {
+ 	.tpr10 = CONFIG_DRAM_SUNXI_TPR10,
+ };
+ 
++static void mctl_set_lpddr4_mr_defaults(struct dram_config *config)
++{
++	if (config->clk <= 936) {
++		config->mr1 = 0x34;
++		config->mr2 = 0x1b;
++	} else if (config->clk <= 1200) {
++		config->mr1 = 0x54;
++		config->mr2 = 0x2d;
++	} else {
++		config->mr1 = 0x64;
++		config->mr2 = 0x36;
++	}
++
++	config->mr3 = 0x33;
++	config->mr4 = 0x03;
++	config->mr11 = 0x04;
++	config->mr12 = 0x72;
++	config->mr14 = 0x08;
++	config->mr22 = 0x26;
++}
++
++static void mctl_apply_radxa_cubie_a5e_profile(struct dram_para *para,
++					       struct dram_config *config,
++					       unsigned long size)
++{
++	if (!IS_ENABLED(CONFIG_RADXA_CUBIE_A5E_DRAM_PROFILES))
++		return;
++
++	config->mr1 = 0x34;
++	config->mr2 = 0x1b;
++	config->mr3 = 0x33;
++	config->mr4 = 0x03;
++	config->mr11 = 0x04;
++	config->mr12 = 0x72;
++	config->mr22 = 0x26;
++
++	if (size <= 0x40000000UL) {
++		para->tpr2 = 0x1f0b0503;
++		para->tpr6 = 0x3a000000;
++		config->tpr11 = 0xc0c0bbbf;
++		config->tpr12 = 0x35352f31;
++		config->mr14 = 0x0e;
++	} else {
++		para->tpr2 = 0x5f090503;
++		para->tpr6 = 0x38000000;
++		config->tpr11 = 0xc6c4c2c0;
++		config->tpr12 = 0x3a373233;
++		config->mr14 = 0x0c;
++	}
++
++	config->tpr14 = 0x48484848;
++}
++
+ static void sunxi_nsi_init(void)
+ {
+ 	/* IOMMU prio 3 */
+@@ -1470,6 +1512,7 @@ static void init_something(void)
+ 
+ unsigned long sunxi_dram_init(void)
+ {
++	struct dram_para final_para = para;
+ 	struct dram_config config;
+ 	unsigned long size;
+ 
+@@ -1486,6 +1529,7 @@ unsigned long sunxi_dram_init(void)
+ 		config.tpr11 = 0x9a9a9a9a;
+ 		config.tpr12 = 0x0e0f070a;
+ 		config.tpr14 = 0x48484848;
++		mctl_set_lpddr4_mr_defaults(&config);
+ 		break;
+ 	default:
+ 		panic("This DRAM setup is currently not supported.\n");
+@@ -1496,16 +1540,19 @@ unsigned long sunxi_dram_init(void)
+ 
+ 	mctl_auto_detect_rank_width(&para, &config);
+ 	mctl_auto_detect_dram_size(&para, &config);
++	size = mctl_calc_size(&config);
+ 
+ 	config.clk = CONFIG_DRAM_CLK;
+ 	config.odt_en = CONFIG_DRAM_SUNXI_ODT_EN;
+ 	config.tpr11 = CONFIG_DRAM_SUNXI_TPR11;
+ 	config.tpr12 = CONFIG_DRAM_SUNXI_TPR12;
+ 	config.tpr14 = CONFIG_DRAM_SUNXI_TPR14;
++	if (para.type == SUNXI_DRAM_TYPE_LPDDR4) {
++		mctl_set_lpddr4_mr_defaults(&config);
++		mctl_apply_radxa_cubie_a5e_profile(&final_para, &config, size);
++	}
+ 
+-	mctl_core_init(&para, &config);
+-
+-	size = mctl_calc_size(&config);
++	mctl_core_init(&final_para, &config);
+ 
+ 	sunxi_nsi_init();
+ 	init_something();
+diff --git a/arch/arm/mach-sunxi/dram_timings/a523_ddr3.c b/arch/arm/mach-sunxi/dram_timings/a523_ddr3.c
+index 6e140bb1..05519924 100644
+--- a/arch/arm/mach-sunxi/dram_timings/a523_ddr3.c
++++ b/arch/arm/mach-sunxi/dram_timings/a523_ddr3.c
+@@ -12,10 +12,11 @@
+ #include <asm/arch/dram.h>
+ #include <asm/arch/cpu.h>
+ 
+-void mctl_set_timing_params(u32 clk)
++void mctl_set_timing_params(const struct dram_config *config)
+ {
+ 	struct sunxi_mctl_ctl_reg * const mctl_ctl =
+ 			(struct sunxi_mctl_ctl_reg *)SUNXI_DRAM_CTL0_BASE;
++	u32 clk = config->clk;
+ 
+ 	/*
+ 	 *					formulas and constraints as of
+diff --git a/arch/arm/mach-sunxi/dram_timings/a523_lpddr4.c b/arch/arm/mach-sunxi/dram_timings/a523_lpddr4.c
+index 940a4d04..01040f63 100644
+--- a/arch/arm/mach-sunxi/dram_timings/a523_lpddr4.c
++++ b/arch/arm/mach-sunxi/dram_timings/a523_lpddr4.c
+@@ -10,12 +10,12 @@
+ #include <asm/arch/dram.h>
+ #include <asm/arch/cpu.h>
+ 
+-void mctl_set_timing_params(u32 clk)
++void mctl_set_timing_params(const struct dram_config *config)
+ {
+ 	struct sunxi_mctl_ctl_reg * const mctl_ctl =
+ 			(struct sunxi_mctl_ctl_reg *)SUNXI_DRAM_CTL0_BASE;
+ 	u8 tcl, tcwl, t_rdata_en, trtp, twr, tphy_wrlat;
+-	unsigned int mr1, mr2;
++	u32 clk = config->clk;
+ 
+ 	u8 tccd		= 4;
+ 	u8 tfaw		= ns_to_t(40, clk);
+@@ -38,8 +38,6 @@ void mctl_set_timing_params(u32 clk)
+ 	u8 trasmax	= (trefi * 9) / 32;
+ 
+ 	if (clk <= 936) {
+-		mr1 = 0x34;
+-		mr2 = 0x1b;
+ 		tcl = 10;
+ 		tcwl = 5;
+ 		t_rdata_en = 17;
+@@ -47,8 +45,6 @@ void mctl_set_timing_params(u32 clk)
+ 		tphy_wrlat = 5;
+ 		twr = 10;
+ 	} else if (clk <= 1200) {
+-		mr1 = 0x54;
+-		mr2 = 0x2d;
+ 		tcl = 14;
+ 		tcwl = 7;
+ 		t_rdata_en = 25;
+@@ -56,8 +52,6 @@ void mctl_set_timing_params(u32 clk)
+ 		tphy_wrlat = 9;
+ 		twr = 15;
+ 	} else {
+-		mr1 = 0x64;
+-		mr2 = 0x36;
+ 		tcl = 16;
+ 		tcwl = 8;
+ 		t_rdata_en = 29;
+@@ -102,10 +96,10 @@ void mctl_set_timing_params(u32 clk)
+ 	writel(0x01f20000, &mctl_ctl->init[1]);
+ 	writel(0x00001705, &mctl_ctl->init[2]);
+ 	writel(0, &mctl_ctl->dfimisc);
+-	writel((mr1 << 16) | mr2, &mctl_ctl->init[3]);
+-	writel(0x00330000, &mctl_ctl->init[4]);
+-	writel(0x00040072, &mctl_ctl->init[6]);
+-	writel(0x00260008, &mctl_ctl->init[7]);
++	writel((config->mr1 << 16) | config->mr2, &mctl_ctl->init[3]);
++	writel(config->mr3 << 16, &mctl_ctl->init[4]);
++	writel((config->mr11 << 16) | config->mr12, &mctl_ctl->init[6]);
++	writel((config->mr22 << 16) | config->mr14, &mctl_ctl->init[7]);
+ 
+ 	clrsetbits_le32(&mctl_ctl->rankctl, 0xff0, 0x660);
+ 
+diff --git a/configs/radxa-cubie-a5e_defconfig b/configs/radxa-cubie-a5e_defconfig
+index 9d204ef5..71695aab 100644
+--- a/configs/radxa-cubie-a5e_defconfig
++++ b/configs/radxa-cubie-a5e_defconfig
+@@ -13,6 +13,7 @@ CONFIG_DRAM_SUNXI_TPR10=0x802f3333
+ CONFIG_DRAM_SUNXI_TPR11=0xc7c5c4c2
+ CONFIG_DRAM_SUNXI_TPR12=0x3533302f
+ CONFIG_MACH_SUN55I_A523=y
++CONFIG_RADXA_CUBIE_A5E_DRAM_PROFILES=y
+ CONFIG_MMC_SUNXI_SLOT_EXTRA=2
+ CONFIG_R_I2C_ENABLE=y
+ # CONFIG_SYS_MALLOC_CLEAR_ON_INIT is not set
+-- 
+Armbian
